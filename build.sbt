@@ -10,7 +10,7 @@ lazy val appName = "third-party-application"
 
 lazy val appDependencies: Seq[ModuleID] = compile ++ test ++ tmpMacWorkaround
 
-val reactiveMongoVer = "0.18.8"
+val reactiveMongoVer = "0.20.13"
 
 lazy val playJsonVersion = "2.7.3"
 lazy val akkaVersion     = "2.5.23"
@@ -25,6 +25,7 @@ lazy val compile = Seq(
   "uk.gov.hmrc" %% "play-hmrc-api" % "4.1.0-play-26",
   "uk.gov.hmrc" %% "metrix" % "4.7.0-play-26",
   "org.reactivemongo" %% "reactivemongo-akkastream" % reactiveMongoVer,
+  "org.reactivemongo" %% "reactivemongo" % reactiveMongoVer,
   "commons-net" % "commons-net" % "3.6",
   "org.typelevel" %% "cats-core" % "2.0.0",
   "com.github.t3hnar" %% "scala-bcrypt" % "4.1",

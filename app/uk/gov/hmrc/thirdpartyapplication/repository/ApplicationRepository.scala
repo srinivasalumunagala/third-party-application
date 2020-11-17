@@ -24,7 +24,6 @@ import play.api.libs.json.Json._
 import play.api.libs.json.{JsObject, _}
 import play.modules.reactivemongo.ReactiveMongoComponent
 import reactivemongo.api.ReadConcern.Available
-import reactivemongo.api.commands.Command.CommandWithPackRunner
 import reactivemongo.api.{Cursor, FailoverStrategy, ReadPreference}
 import reactivemongo.bson.{BSONDateTime, BSONObjectID}
 import reactivemongo.play.json._
@@ -47,16 +46,21 @@ class ApplicationRepository @Inject()(mongo: ReactiveMongoComponent)(implicit va
     MongoFormat.formatApplicationData, ReactiveMongoFormats.objectIdFormats)
     with MetricsHelper {
 
+  import collection.BatchCommands.AggregationFramework
+  import AggregationFramework.{Set => AFSet, Cursor => AFCursor, _}
+  import collection.PipelineOperator
+
   implicit val dateFormat = ReactiveMongoFormats.dateTimeFormats
 
-  private val subscriptionsLookup: JsObject = Json.obj(
-    f"$$lookup" -> Json.obj(
-      "from" -> "subscription",
-      "localField" -> "id",
-      "foreignField" -> "applications",
-      "as" -> "subscribedApis"))
+  private val subscriptionsLookup: PipelineOperator = Lookup(
+    from = "subscription",
+    localField = "id",
+    foreignField = "applications",
+    as = "subscribedApis"
+  )
 
-  private val applicationProjection = Json.obj(f"$$project" -> Json.obj(
+  private val applicationProjection: PipelineOperator = Project(
+    Json.obj(
     "id" -> true,
     "name" -> true,
     "normalisedName" -> true,
@@ -69,7 +73,9 @@ class ApplicationRepository @Inject()(mongo: ReactiveMongoComponent)(implicit va
     "createdOn" -> true,
     "lastAccess" -> true,
     "rateLimitTier" -> true,
-    "environment" -> true))
+    "environment" -> true
+    )
+  )
 
   override def indexes = List(
     createSingleFieldAscendingIndex(
@@ -234,26 +240,26 @@ class ApplicationRepository @Inject()(mongo: ReactiveMongoComponent)(implicit va
   }
 
   def searchApplications(applicationSearch: ApplicationSearch): Future[PaginatedApplicationData] = {
-    val filters = applicationSearch.filters.map(filter => convertFilterToQueryClause(filter, applicationSearch))
+    val filters = applicationSearch.filters.map(filter => convertFilterToQueryClause(filter, applicationSearch)).filter(_.isDefined).map(_.get)
     val sort = List(convertToSortClause(applicationSearch.sort))
 
     val pagination = List(
-      Json.obj(f"$$skip" -> (applicationSearch.pageNumber - 1) * applicationSearch.pageSize),
-      Json.obj(f"$$limit" -> applicationSearch.pageSize))
+      Skip((applicationSearch.pageNumber - 1) * applicationSearch.pageSize),
+      Limit(applicationSearch.pageSize)
+    )
 
-    runApplicationQueryAggregation(commandQueryDocument(filters, pagination, sort))
+    commandQueryDocument(filters, pagination, sort)
+    // Future.successful(PaginatedApplicationData(List.empty, List.empty, List.empty))
   }
 
-  private def matches(predicates: (String, JsValueWrapper)): JsObject = Json.obj(f"$$match" -> Json.obj(predicates))
+  private def matches(predicates: (String, JsValueWrapper)): PipelineOperator = Match(Json.obj(predicates))
 
-  private def sorting(clause: (String, JsValueWrapper)): JsObject = Json.obj(f"$$sort" -> Json.obj(clause))
+  private def convertFilterToQueryClause(applicationSearchFilter: ApplicationSearchFilter, applicationSearch: ApplicationSearch): Option[PipelineOperator] = {
+    def applicationStatusMatch(state: State): PipelineOperator = matches("state.name" -> state.toString)
 
-  private def convertFilterToQueryClause(applicationSearchFilter: ApplicationSearchFilter, applicationSearch: ApplicationSearch): JsObject = {
-    def applicationStatusMatch(state: State): JsObject = matches("state.name" -> state.toString)
+    def accessTypeMatch(accessType: AccessType): PipelineOperator = matches("access.accessType" -> accessType.toString)
 
-    def accessTypeMatch(accessType: AccessType): JsObject = matches("access.accessType" -> accessType.toString)
-
-    def specificAPISubscription(apiContext: String, apiVersion: String) = {
+    def specificAPISubscription(apiContext: String, apiVersion: String): PipelineOperator = {
       if (apiVersion.isEmpty) {
         matches("subscribedApis.apiIdentifier.context" -> apiContext)
       } else {
@@ -261,85 +267,94 @@ class ApplicationRepository @Inject()(mongo: ReactiveMongoComponent)(implicit va
       }
     }
 
+
     applicationSearchFilter match {
       // API Subscriptions
-      case NoAPISubscriptions => matches("subscribedApis" -> Json.obj(f"$$size" -> 0))
-      case OneOrMoreAPISubscriptions => matches("subscribedApis" -> Json.obj(f"$$gt" -> Json.obj(f"$$size" -> 0)))
-      case SpecificAPISubscription => specificAPISubscription(applicationSearch.apiContext.getOrElse(""), applicationSearch.apiVersion.getOrElse(""))
+        case NoAPISubscriptions => Some(matches("subscribedApis" -> Json.obj(f"$$size" -> 0)))
+        case OneOrMoreAPISubscriptions => Some(matches("subscribedApis" -> Json.obj(f"$$gt" -> Json.obj(f"$$size" -> 0))))
+        case SpecificAPISubscription => Some(specificAPISubscription(applicationSearch.apiContext.getOrElse(""), applicationSearch.apiVersion.getOrElse("")))
 
-      // Application Status
-      case Created => applicationStatusMatch(State.TESTING)
-      case PendingGatekeeperCheck => applicationStatusMatch(State.PENDING_GATEKEEPER_APPROVAL)
-      case PendingSubmitterVerification => applicationStatusMatch(State.PENDING_REQUESTER_VERIFICATION)
-      case Active => applicationStatusMatch(State.PRODUCTION)
+        // Application Status
+        case Created => Some(applicationStatusMatch(State.TESTING))
+        case PendingGatekeeperCheck => Some(applicationStatusMatch(State.PENDING_GATEKEEPER_APPROVAL))
+        case PendingSubmitterVerification => Some(applicationStatusMatch(State.PENDING_REQUESTER_VERIFICATION))
+        case Active => Some(applicationStatusMatch(State.PRODUCTION))
 
-      // Terms of Use
-      case TermsOfUseAccepted => matches("checkInformation.termsOfUseAgreements" -> Json.obj(f"$$gt" -> Json.obj(f"$$size" -> 0)))
-      case TermsOfUseNotAccepted =>
-        matches(
-          f"$$or" ->
-            Json.arr(
-              Json.obj("checkInformation" -> Json.obj(f"$$exists" -> false)),
-              Json.obj("checkInformation.termsOfUseAgreements" -> Json.obj(f"$$exists" -> false)),
-              Json.obj("checkInformation.termsOfUseAgreements" -> Json.obj(f"$$size" -> 0))))
+        // Terms of Use
+        case TermsOfUseAccepted => Some(matches("checkInformation.termsOfUseAgreements" -> Json.obj(f"$$gt" -> Json.obj(f"$$size" -> 0))))
+        case TermsOfUseNotAccepted =>
+          Some(matches(
+            f"$$or" ->
+              Json.arr(
+                Json.obj("checkInformation" -> Json.obj(f"$$exists" -> false)),
+                Json.obj("checkInformation.termsOfUseAgreements" -> Json.obj(f"$$exists" -> false)),
+                Json.obj("checkInformation.termsOfUseAgreements" -> Json.obj(f"$$size" -> 0)))
+          ))
 
-      // Access Type
-      case StandardAccess => accessTypeMatch(AccessType.STANDARD)
-      case ROPCAccess => accessTypeMatch(AccessType.ROPC)
-      case PrivilegedAccess => accessTypeMatch(AccessType.PRIVILEGED)
+        // Access Type
+        case StandardAccess => Some(accessTypeMatch(AccessType.STANDARD))
+        case ROPCAccess => Some(accessTypeMatch(AccessType.ROPC))
+        case PrivilegedAccess => Some(accessTypeMatch(AccessType.PRIVILEGED))
 
-      // Text Search
-      case ApplicationTextSearch => regexTextSearch(List("id", "name", "tokens.production.clientId"), applicationSearch.textToSearch.getOrElse(""))
+        // Text Search
+        case ApplicationTextSearch => Some(regexTextSearch(List("id", "name", "tokens.production.clientId"), applicationSearch.textToSearch.getOrElse("")))
 
-      // Last Use Date
-      case lastUsedBefore: LastUseBeforeDate => lastUsedBefore.toMongoMatch
-      case lastUsedAfter: LastUseAfterDate => lastUsedAfter.toMongoMatch
-      case _  => Json.obj() // Only here to complete the match
-    }
+        // Last Use Date
+        case lastUsedBefore: LastUseBeforeDate => Some(Match(lastUsedBefore.toMongoMatch))
+        case lastUsedAfter: LastUseAfterDate => Some(Match(lastUsedAfter.toMongoMatch))
+        case _ => None
+      }
   }
 
-  private def convertToSortClause(sort: ApplicationSort): JsObject = sort match {
-    case NameAscending => sorting("name" -> 1)
-    case NameDescending => sorting("name" -> -1)
-    case SubmittedAscending => sorting("createdOn" -> 1)
-    case SubmittedDescending => sorting("createdOn" -> -1)
-    case LastUseDateAscending => sorting("lastAccess" -> 1)
-    case LastUseDateDescending => sorting("lastAccess" -> -1)
-    case _ => sorting("name" -> 1)
+  private def convertToSortClause(sort: ApplicationSort): PipelineOperator = sort match {
+    case NameAscending => Sort(Ascending("name"))
+    case NameDescending => Sort(Descending("name"))
+    case SubmittedAscending => Sort(Ascending("createdOn"))
+    case SubmittedDescending => Sort(Descending("createdOn"))
+    case LastUseDateAscending => Sort(Ascending("lastAccess"))
+    case LastUseDateDescending => Sort(Descending("lastAccess"))
+    case _ => Sort(Ascending("name"))
   }
 
-  private def regexTextSearch(fields: List[String], searchText: String): JsObject =
-    matches(f"$$or" -> fields.map(field => Json.obj(field -> Json.obj(f"$$regex" -> searchText, f"$$options" -> "i"))))
+  private def regexTextSearch(fields: List[String], searchText: String): PipelineOperator =
+    matches(f"$$or" -> fields.map(
+      field => Json.obj(field -> Json.obj(f"$$regex" -> searchText, f"$$options" -> "i"))
+      )
+    )
 
-  private def runApplicationQueryAggregation(commandDocument: JsObject): Future[PaginatedApplicationData] = {
-    val runner = CommandWithPackRunner(JSONSerializationPack, FailoverStrategy())
-    runner
-      .apply(collection.db, runner.rawCommand(commandDocument))
-      .one[JsObject](ReadPreference.nearest)
-      .flatMap(processResults[PaginatedApplicationData])
-  }
+  // private def processResults[T](json: JsObject)(implicit fjs: Reads[T]): Future[T] = {
+  //   // TODO: I don't think this is returning more than 1 batch (~100?) worth of data.
+  //   (json \ "cursor" \ "firstBatch" \ 0).validate[T] match {
+  //     case JsSuccess(result, _) => Future.successful(result)
+  //     case JsError(errors) => Future.failed(new RuntimeException((json \ "errmsg").asOpt[String].getOrElse(errors.mkString(","))))
+  //   }
+  // }
 
-  private def processResults[T](json: JsObject)(implicit fjs: Reads[T]): Future[T] = {
-    // TODO: I don't think this is returning more than 1 batch (~100?) worth of data.
-    (json \ "cursor" \ "firstBatch" \ 0).validate[T] match {
-      case JsSuccess(result, _) => Future.successful(result)
-      case JsError(errors) => Future.failed(new RuntimeException((json \ "errmsg").asOpt[String].getOrElse(errors.mkString(","))))
-    }
-  }
+  private def commandQueryDocument(filters: List[PipelineOperator], pagination: List[PipelineOperator], sort: List[PipelineOperator]): Future[PaginatedApplicationData] = {
+    val filteredPipelineCount: List[PipelineOperator] = subscriptionsLookup :: filters ++ List(Count("total"))
+    val paginatedFilteredAndSortedPipeline: List[PipelineOperator]= subscriptionsLookup :: filters ++ sort ++ pagination ++ List(applicationProjection)
 
-  private def commandQueryDocument(filters: List[JsObject], pagination: List[JsObject], sort: List[JsObject]): JsObject = {
-    val totalCount = Json.arr(Json.obj(f"$$count" -> "total"))
-    val filteredPipelineCount = Json.toJson(subscriptionsLookup +: filters :+ Json.obj(f"$$count" -> "total"))
-    val paginatedFilteredAndSortedPipeline = Json.toJson((subscriptionsLookup +: filters) ++ sort ++ pagination :+ applicationProjection)
+    val ops = Facet(List(
+      "totals" -> ((Count("total"), List.empty)),
+      "matching" -> ((filteredPipelineCount.head, filteredPipelineCount.tail)),
+      "aplications" -> ((paginatedFilteredAndSortedPipeline.head, paginatedFilteredAndSortedPipeline.tail))
+    ))
 
-    Json.obj(
-      "aggregate" -> "application",
-      "cursor" -> Json.obj(),
-      "pipeline" -> Json.arr(Json.obj(
-        f"$$facet" -> Json.obj(
-          "totals" -> totalCount,
-          "matching" -> filteredPipelineCount,
-          "applications" -> paginatedFilteredAndSortedPipeline))))
+    import cats.implicits._
+    import cats.data.OptionT
+
+    val result = for {
+      foData <- OptionT(
+                  collection.aggregatorContext[JsObject](ops)
+                  .prepared
+                  .cursor
+                  .collect(-1, Cursor.FailOnError[List[JsObject]]())
+                  .map(_.headOption)
+                )
+      data <- OptionT.fromOption[Future](Json.fromJson[PaginatedApplicationData](foData).asOpt)
+    } yield data
+
+    result.getOrElse(PaginatedApplicationData(List.empty, List.empty, List.empty))
   }
 
   def fetchAllForContext(apiContext: String): Future[List[ApplicationData]] =
@@ -410,3 +425,9 @@ sealed trait ApplicationModificationResult
 final case class SuccessfulApplicationModificationResult(numberOfDocumentsUpdated: Int) extends ApplicationModificationResult
 
 final case class UnsuccessfulApplicationModificationResult(message: Option[String]) extends ApplicationModificationResult
+
+final case class FacetResult(totals: Int, matching: Int, applications: List[ApplicationData])
+
+object FacetResult {
+  implicit val reads = Json.reads[FacetResult]
+}

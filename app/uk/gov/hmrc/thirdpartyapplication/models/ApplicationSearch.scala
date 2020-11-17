@@ -144,28 +144,26 @@ case class LastUseBeforeDate(lastUseDate: DateTime) extends LastUseDateFilter {
   implicit val dateFormat = ReactiveMongoFormats.dateTimeFormats
 
   def toMongoMatch =
-    Json.obj("$match" ->
       Json.obj("$or" ->
         Json.arr(
           Json.obj("lastAccess" -> Json.obj("$lte" -> lastUseDate)),
           Json.obj("$and" ->
             Json.arr(
               Json.obj("lastAccess" -> Json.obj("$exists" -> false)),
-              Json.obj("createdOn" -> Json.obj("$lte" -> lastUseDate)))))))
+              Json.obj("createdOn" -> Json.obj("$lte" -> lastUseDate))))))
 }
 
 case class LastUseAfterDate(lastUseDate: DateTime) extends LastUseDateFilter {
   implicit val dateFormat = ReactiveMongoFormats.dateTimeFormats
 
   def toMongoMatch =
-    Json.obj("$match" ->
       Json.obj("$or" ->
         Json.arr(
           Json.obj("lastAccess" -> Json.obj("$gte" -> lastUseDate)),
           Json.obj("$and" ->
             Json.arr(
               Json.obj("lastAccess" -> Json.obj("$exists" -> false)),
-              Json.obj("createdOn" -> Json.obj("$gte" -> lastUseDate)))))))
+              Json.obj("createdOn" -> Json.obj("$gte" -> lastUseDate))))))
 }
 
 case object LastUseDateFilter extends LastUseDateFilter {
